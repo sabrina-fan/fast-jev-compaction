@@ -1,5 +1,7 @@
 # fast-jev-compaction
 
+> **NOTE:** This repository is a modified fork of [`tamaratran/fast-jev-compaction`](https://github.com/tamaratran/fast-jev-compaction) (MIT). Additions on top of upstream: `JEV_*`/`TYPESAFE_*` env resolution for any System One-compatible endpoint (`src/config.ts`), a CLI (`src/cli.ts`), an stdio MCP server (`src/serve-mcp.ts`, `jev-compaction-mcp`), and a **Devin `PostCompaction` restore hook** (`src/devin-post-compaction.ts`) that re-injects verbatim tool details lost by the built-in summary.
+
 Claude Code plugin that replaces the compaction summary with Jev decisions:
 every tool call and result is scored in one fast request, stale ones are
 dropped or truncated, everything kept stays verbatim. Also usable as an npm
