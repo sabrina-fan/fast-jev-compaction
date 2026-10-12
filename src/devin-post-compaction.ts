@@ -16,14 +16,17 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { compactMessages } from './messages.js';
 import { collectToolCalls } from './state.js';
 import { envOptions } from './config.js';
 import type { CallDecision, Message } from './types.js';
 
 const TRANSCRIPTS_DIR = join(homedir(), '.local/share/devin/cli/transcripts');
+const SESSIONS_DB = join(homedir(), '.local/share/devin/cli/sessions.db');
 const LOG_FILE = join(homedir(), '.local/share/devin/cli/compaction-restores.log');
 const TAIL_STEPS = 15; // approximate the verbatim tail Devin keeps post-compaction
+const MAX_STEPS = 300; // judge only the recent window; older history is the summary's job
 const MAX_ITEMS = 10;
 const MAX_CHARS = 6000;
 const RESULT_SNIPPET = 900;
@@ -47,6 +50,68 @@ interface DevinStep {
 /** Transcript steps sometimes carry non-string `message` payloads (structured blocks). */
 const stepText = (v: unknown): string =>
   typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v);
+
+interface ChatMessage {
+  role?: string;
+  content?: unknown;
+  tool_calls?: { id?: string; name?: string; arguments?: Record<string, unknown> }[];
+  tool_call_id?: string;
+}
+
+/**
+ * Live history lives in sessions.db (message_nodes forest; the transcript JSON
+ * is only a post-compaction snapshot that is absent or truncated around
+ * compaction time). Post-compaction the main chain is a fresh ~16-node root —
+ * the real pre-compaction history stays in the same table's other trees, so we
+ * take every node of the session in insertion order and window the recent tail.
+ * Tool results fold into the preceding assistant step's observation so the
+ * shape matches transcript steps.
+ */
+const HISTORY_SQL =
+  'SELECT chat_message FROM message_nodes WHERE session_id = ? ORDER BY row_id';
+
+function stepsFromDb(sessionId: string): DevinStep[] {
+  // WAL 模式：只读打开无法做 shm/WAL 恢复会报 "database or disk is full"，
+  // 用默认读写打开、只做 SELECT——WAL 下读不阻塞写者。
+  const db = new DatabaseSync(SESSIONS_DB);
+  try {
+    const rows = db.prepare(HISTORY_SQL).all(sessionId) as { chat_message: string }[];
+    const steps: DevinStep[] = [];
+    for (const { chat_message } of rows) {
+      let msg: ChatMessage;
+      try {
+        msg = JSON.parse(chat_message) as ChatMessage;
+      } catch {
+        continue;
+      }
+      if (msg.role === 'user') {
+        steps.push({ source: 'user', message: msg.content });
+      } else if (msg.role === 'assistant') {
+        steps.push({
+          source: 'agent',
+          message: msg.content,
+          tool_calls: (msg.tool_calls ?? []).map((c) => ({
+            tool_call_id: c.id ?? '',
+            function_name: c.name ?? '',
+            arguments: c.arguments ?? {},
+          })),
+          observation: { results: [] },
+        });
+      } else if (msg.role === 'tool') {
+        const result = { source_call_id: msg.tool_call_id ?? '', content: msg.content };
+        const last = steps[steps.length - 1];
+        if (last?.source === 'agent') {
+          (last.observation ??= { results: [] }).results!.push(result);
+        } else {
+          steps.push({ source: 'agent', message: '', observation: { results: [result] } });
+        }
+      }
+    }
+    return steps;
+  } finally {
+    db.close();
+  }
+}
 
 function toMessages(steps: DevinStep[]): Message[] {
   const out: Message[] = [];
@@ -127,18 +192,25 @@ async function main(): Promise<void> {
   const summary = payload.summary ?? '';
   if (!sessionId) return;
 
-  const transcriptPath = join(TRANSCRIPTS_DIR, `${sessionId}.json`);
-  if (!existsSync(transcriptPath)) return log(`no transcript for ${sessionId}`);
-
-  const transcript = JSON.parse(readFileSync(transcriptPath, 'utf8')) as { steps?: DevinStep[] };
-  const steps = transcript.steps ?? [];
+  let steps: DevinStep[] = [];
+  try {
+    steps = stepsFromDb(sessionId);
+  } catch (e) {
+    log(`sessions.db read failed for ${sessionId}: ${e instanceof Error ? e.message : String(e)}; trying transcript file`);
+  }
+  if (steps.length === 0) {
+    const transcriptPath = join(TRANSCRIPTS_DIR, `${sessionId}.json`);
+    if (!existsSync(transcriptPath)) return log(`no transcript for ${sessionId}`);
+    steps = (JSON.parse(readFileSync(transcriptPath, 'utf8')) as { steps?: DevinStep[] }).steps ?? [];
+  }
   if (steps.length === 0) return;
+  const windowed = steps.slice(-MAX_STEPS);
 
-  const messages = toMessages(steps);
+  const messages = toMessages(windowed);
   const result = await compactMessages(messages, { ...envOptions(), preserveRecentMessages: TAIL_STEPS });
 
   // Post-compaction context ≈ summary + verbatim tail Devin retains.
-  const tailText = steps
+  const tailText = windowed
     .slice(-TAIL_STEPS)
     .map((s) => [s.message ?? '', ...(s.observation?.results ?? []).map((r) => String(r.content ?? ''))].join(' '))
     .join('\n');
@@ -149,7 +221,7 @@ async function main(): Promise<void> {
     collectToolCalls(messages, TAIL_STEPS).map((c) => [c.id, c] as const),
   );
   const resultByCall = new Map<string, string>();
-  for (const s of steps) {
+  for (const s of windowed) {
     for (const c of s.tool_calls ?? []) {
       const r = (s.observation?.results ?? []).find((x) => x.source_call_id === c.tool_call_id);
       resultByCall.set(c.tool_call_id, typeof r?.content === 'string' ? r.content : JSON.stringify(r?.content ?? ''));
